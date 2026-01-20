@@ -53,12 +53,10 @@ def build_scatter(
 
 
 def fig_to_png_bytes(fig) -> bytes:
-    # Uses kaleido under the hood.
-    with tempfile.TemporaryDirectory() as d:
-        path = f"{d}/chart.png"
-        fig.write_image(path, format="png", scale=2)
-        with open(path, "rb") as f:
-            return f.read()
+    # More reliable than spinning up a browser + temp files.
+    # Requires kaleido (pinned in requirements.txt).
+    return fig.to_image(format="png", scale=2)
+
 
 
 def fig_to_html_bytes(fig) -> bytes:
@@ -162,6 +160,10 @@ st.subheader("Chart")
 st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
 
 st.subheader("Export")
+st.caption(
+    "PNG export note: The **Download PNG** button generates a clean, server-rendered image. "
+    "Use the chart toolbar’s camera icon exports a PNG that matches theme. "
+)
 colA, colB = st.columns(2)
 
 with colA:

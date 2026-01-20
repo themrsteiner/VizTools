@@ -1,5 +1,5 @@
 streamlit
-plotly
+plotly>=5.18,<6
 pandas
 openpyxl
-kaleido
+kaleido==0.2.1
