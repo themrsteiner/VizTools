@@ -1,0 +1,13 @@
+# Python virtual environment
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Streamlit runtime files
+.streamlit/
+
+# OS junk
+.DS_Store
+Thumbs.db
