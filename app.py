@@ -1,17 +1,22 @@
 import io
-import tempfile
+import time
 from typing import List, Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+# ----------------------------
+# Page setup
+# ----------------------------
 st.set_page_config(page_title="VizTools", layout="wide")
-
 st.title("VizTools — CSV/Excel Visualizer")
 st.caption("Upload a file, map columns, and export the chart (HTML/PNG).")
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 @st.cache_data(show_spinner=False)
 def load_table(file_bytes: bytes, filename: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
     name = filename.lower()
@@ -37,6 +42,7 @@ def build_scatter(
     size: Optional[str],
     hover: List[str],
     opacity: float,
+    size_max: int,
 ):
     fig = px.scatter(
         df,
@@ -47,16 +53,15 @@ def build_scatter(
         size=size if size else None,
         hover_data=hover if hover else None,
         opacity=opacity,
+        size_max=size_max,
     )
     fig.update_layout(margin=dict(l=20, r=20, t=30, b=20), legend_title_text="")
     return fig
 
 
 def fig_to_png_bytes(fig) -> bytes:
-    # More reliable than spinning up a browser + temp files.
-    # Requires kaleido (pinned in requirements.txt).
+    # Server-side PNG export. (Works well with plotly<6 + kaleido==0.2.1)
     return fig.to_image(format="png", scale=2)
-
 
 
 def fig_to_html_bytes(fig) -> bytes:
@@ -64,6 +69,23 @@ def fig_to_html_bytes(fig) -> bytes:
     return html.encode("utf-8")
 
 
+def debounce_ok(key: str, cooldown_sec: float = 0.2) -> bool:
+    """
+    Prevents rapid repeat clicks from causing rerun storms.
+    Returns True if enough time has passed since the last accepted click.
+    """
+    now = time.time()
+    last_key = f"_last_click_{key}"
+    last = float(st.session_state.get(last_key, 0.0))
+    if (now - last) < cooldown_sec:
+        return False
+    st.session_state[last_key] = now
+    return True
+
+
+# ----------------------------
+# Sidebar
+# ----------------------------
 with st.sidebar:
     st.header("1) Upload")
     uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
@@ -88,7 +110,7 @@ if not uploaded:
 
 file_bytes = uploaded.getvalue()
 
-# Excel sheet selector
+# Excel sheet selector (if needed)
 sheet = None
 if uploaded.name.lower().endswith((".xlsx", ".xls")):
     try:
@@ -111,7 +133,6 @@ df.columns = [str(c) for c in df.columns]
 
 st.subheader("Data preview")
 st.write(f"Rows: **{len(df):,}** | Columns: **{len(df.columns):,}**")
-# SECTION A CHANGE: use_container_width -> width
 st.dataframe(df.head(200), width="stretch")
 
 numeric_cols, other_cols = split_columns(df)
@@ -121,6 +142,10 @@ if len(numeric_cols) < 2:
     st.warning("Need at least **two numeric columns** for X and Y.")
     st.stop()
 
+
+# ----------------------------
+# Mapping controls
+# ----------------------------
 st.subheader("Mapping")
 c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
 
@@ -131,7 +156,7 @@ with c1:
 with c2:
     color = st.selectbox("Color (categorical)", ["(none)"] + other_cols, index=0)
     symbol = st.selectbox("Shape / symbol (categorical)", ["(none)"] + other_cols, index=0)
-    size = st.selectbox("Size (numeric)", ["(none)"] + numeric_cols, index=0)
+    size_choice = st.selectbox("Size (numeric)", ["(none)"] + numeric_cols, index=0)
 
 with c3:
     tooltip = st.multiselect(
@@ -140,30 +165,102 @@ with c3:
         default=[c for c in [x, y] if c in all_cols],
     )
 
+size_col = None if size_choice == "(none)" else size_choice
+
+
+# ----------------------------
+# Appearance: point size zoom buttons
+# (modifier behavior, never replaces size mapping)
+# ----------------------------
+st.subheader("Appearance")
+
+# Internal scale
+if "point_size_scale" not in st.session_state:
+    st.session_state.point_size_scale = 1.0
+
+STEP = 0.10
+MIN_SCALE = 0.2
+MAX_SCALE = 6.0
+
+with st.container(border=True):
+    st.markdown("**Point size (global)**")
+
+    b1, b2, b3, _spacer = st.columns([0.12, 0.12, 0.18, 1.58], vertical_alignment="center")
+
+    with b1:
+        if st.button("➖", help="Make points smaller"):
+            if debounce_ok("zoom", cooldown_sec=0.2):
+                st.session_state.point_size_scale = max(
+                    MIN_SCALE, round(st.session_state.point_size_scale * (1 - STEP), 6)
+                )
+
+    with b2:
+        if st.button("➕", help="Make points larger"):
+            if debounce_ok("zoom", cooldown_sec=0.2):
+                st.session_state.point_size_scale = min(
+                    MAX_SCALE, round(st.session_state.point_size_scale * (1 + STEP), 6)
+                )
+
+    with b3:
+        if st.button("Reset", help="Reset point size to default"):
+            if debounce_ok("zoom", cooldown_sec=0.2):
+                st.session_state.point_size_scale = 1.0
+
+
+# Base sizing constants (used internally)
+BASE_POINT_SIZE = 10  # used when Size = (none)
+BASE_SIZE_MAX = 20    # used when Size is data-driven
+
+# When Size is data-driven, scale the overall bubble cap (preserves relative sizes)
+size_max = max(2, int(round(BASE_SIZE_MAX * st.session_state.point_size_scale)))
+
+
+# ----------------------------
+# Data sampling (performance)
+# ----------------------------
 plot_df = df
 if len(df) > int(max_rows):
     plot_df = df.sample(int(max_rows), random_state=42)
 
+
+# ----------------------------
+# Build figure
+# ----------------------------
 fig = build_scatter(
     plot_df,
     x=x,
     y=y,
     color=None if color == "(none)" else color,
     symbol=None if symbol == "(none)" else symbol,
-    size=None if size == "(none)" else size,
+    size=size_col,
     hover=tooltip,
     opacity=opacity,
+    size_max=size_max,
 )
 
+# If Size=(none), apply global scaled fixed marker size
+if size_col is None:
+    fixed_size = int(round(BASE_POINT_SIZE * st.session_state.point_size_scale))
+    fig.update_traces(marker=dict(size=max(1, fixed_size)))
+
+
+# ----------------------------
+# Render chart
+# ----------------------------
 st.subheader("Chart")
-# SECTION A CHANGE: use_container_width -> width
 st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
 
+
+# ----------------------------
+# Export
+# ----------------------------
 st.subheader("Export")
 st.caption(
     "PNG export note: The **Download PNG** button generates a clean, server-rendered image. "
-    "Use the chart toolbar’s camera icon exports a PNG that matches theme. "
+    "The chart toolbar’s camera icon exports a PNG that matches what you see on screen "
+    "(including background and theme). Both exports are accurate."
 )
+
 colA, colB = st.columns(2)
 
 with colA:
